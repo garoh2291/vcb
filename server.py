@@ -6,10 +6,12 @@ can start/stop it from the browser. Auto-starts the watcher on launch (AUTOSTART
 import logging
 import sys
 import threading
+import time
 
 from flask import Flask, jsonify, send_file
 
 import config
+import telegram
 from watcher import WatcherState, run_watcher
 
 logging.basicConfig(
@@ -46,6 +48,80 @@ def stop_watcher():
         _stop_event.set()
     _thread.join(timeout=30)
     return True
+
+
+def _running():
+    return bool(_thread and _thread.is_alive())
+
+
+# ---- Telegram control (long-polling) ----
+
+def _status_text():
+    d = state.snapshot()
+
+    def ago(t):
+        return "—" if not t else f"{int(d['server_time'] - t)}s ago"
+
+    return (f"{'🟢 RUNNING' if d['running'] else '🔴 STOPPED'} · "
+            f"{'online' if d['online'] else 'OFFLINE'}\n"
+            f"Checks: {d['cycles']}\n"
+            f"Last check: {ago(d['last_check'])}\n"
+            f"Result: {d['last_result']}")
+
+
+def _handle_command(text):
+    t = text.strip().lower()
+    if t in ("/start", "▶ start", "start"):
+        ok = start_watcher()
+        telegram.send_message("▶ Watcher started." if ok else "Already running.", keyboard=True)
+    elif t in ("/stop", "■ stop", "stop"):
+        ok = stop_watcher()
+        telegram.send_message("■ Watcher stopped." if ok else "Already stopped.", keyboard=True)
+    elif t in ("/run", "🔄 run now", "run", "run now"):
+        if _running():
+            state.request_check(False)
+            telegram.send_message("🔄 Checking now…", keyboard=True)
+        else:
+            telegram.send_message("Watcher is stopped. Send /start first.", keyboard=True)
+    elif t in ("/shots", "📸 run + shots", "shots", "run + shots"):
+        if _running():
+            state.request_check(True)
+            telegram.send_message("📸 Checking now + sending screenshots…", keyboard=True)
+        else:
+            telegram.send_message("Watcher is stopped. Send /start first.", keyboard=True)
+    elif t in ("/status", "📊 status", "status"):
+        telegram.send_message(_status_text(), keyboard=True)
+    else:
+        telegram.send_message(
+            "Commands:\n/start · /stop\n/run (check now)\n/shots (check + screenshots)\n/status",
+            keyboard=True)
+
+
+def telegram_poller():
+    """Long-poll Telegram for commands. Only the configured chat id is honoured."""
+    offset = None
+    # Drain any backlog so we don't replay stale commands on boot.
+    try:
+        old = telegram.get_updates(timeout=0)
+        if old:
+            offset = old[-1]["update_id"] + 1
+    except Exception:  # noqa: BLE001
+        pass
+    while True:
+        try:
+            for u in telegram.get_updates(offset=offset, timeout=50):
+                offset = u["update_id"] + 1
+                msg = u.get("message") or u.get("edited_message")
+                if not msg:
+                    continue
+                if str(msg.get("chat", {}).get("id")) != str(config.TELEGRAM_CHAT_ID):
+                    continue  # ignore everyone but you
+                text = msg.get("text", "")
+                if text:
+                    _handle_command(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram poller error: %s", e)
+            time.sleep(5)
 
 
 @app.get("/api/status")
@@ -266,6 +342,11 @@ setInterval(refresh,3000); refresh();
 
 
 def main():
+    # Register the "/" command menu and start the Telegram control poller.
+    telegram.set_commands()
+    threading.Thread(target=telegram_poller, daemon=True).start()
+    telegram.send_message("🤖 Visa watcher control ready. Tap a button or use /help.",
+                          keyboard=True)
     if config.AUTOSTART:
         start_watcher()
     log.info("Dashboard on http://127.0.0.1:%d", config.PORT)

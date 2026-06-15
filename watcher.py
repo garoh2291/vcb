@@ -37,6 +37,22 @@ class WatcherState:
         self.last_screenshot = None
         self.month_shots = []   # [{"label": "June 2026", "path": "...png"}]
         self._log = deque(maxlen=300)
+        # On-demand control (set by the Telegram poller, consumed by the watcher thread).
+        self._wake = threading.Event()
+        self._send_shots = False
+
+    def request_check(self, send_shots=False):
+        """Ask the watcher to run a check immediately (interrupts its sleep)."""
+        with self._lock:
+            if send_shots:
+                self._send_shots = True
+        self._wake.set()
+
+    def take_send_shots(self) -> bool:
+        with self._lock:
+            v = self._send_shots
+            self._send_shots = False
+        return v
 
     def event(self, msg, level="info"):
         getattr(log, level, log.info)(msg)
@@ -69,13 +85,17 @@ class WatcherState:
             }
 
 
-def _sleep(seconds, stop_event):
-    """Interruptible sleep — wakes immediately if stop is requested."""
+def _sleep(seconds, stop_event, wake=None):
+    """Interruptible sleep — returns early if stop is requested or a run-now wake fires."""
     end = _now() + seconds
     while _now() < end:
         if stop_event.is_set():
             return
-        time.sleep(min(1.0, end - _now()))
+        if wake is not None and wake.wait(timeout=min(1.0, end - _now())):
+            wake.clear()
+            return
+        if wake is None:
+            time.sleep(min(1.0, end - _now()))
 
 
 def _screenshot(page, name):
@@ -176,6 +196,7 @@ def run_watcher(state, stop_event):
 
                             # --- one check cycle ---
                             cycle_start = _now()
+                            send_shots = state.take_send_shots()  # on-demand /shots request
                             if _reach_calendar(page, state):
                                 month_shots = []
 
@@ -228,10 +249,20 @@ def run_watcher(state, stop_event):
                                 state.event(f"Check: {'FOUND ✶' if found else 'none'} — {info}")
                                 if found:
                                     last_heartbeat = _now()
+                                # On-demand /shots: send each month screenshot now.
+                                if send_shots:
+                                    telegram.send_message(f"📸 On-demand check — {info}")
+                                    for m in month_shots:
+                                        if m.get("path"):
+                                            telegram.send_photo(m["path"], m["label"])
                             else:
                                 state.set(last_check=_now(),
                                           last_result="navigation/login issue",
                                           cycles=state.cycles + 1)
+                                if send_shots:
+                                    telegram.send_message(
+                                        "⚠️ On-demand check: couldn't reach the calendar "
+                                        "(login/navigation). Will retry next cycle.")
 
                             # --- heartbeat ---
                             if _now() - last_heartbeat >= config.HEARTBEAT_INTERVAL:
@@ -243,7 +274,7 @@ def run_watcher(state, stop_event):
                             # while still averaging ~CHECK_INTERVAL regardless of check duration.
                             elapsed = _now() - cycle_start
                             target = config.CHECK_INTERVAL * random.uniform(0.85, 1.25)
-                            _sleep(max(20.0, target - elapsed), stop_event)
+                            _sleep(max(20.0, target - elapsed), stop_event, wake=state._wake)
                     finally:
                         try:
                             context.close()

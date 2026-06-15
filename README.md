@@ -84,8 +84,23 @@ launchctl list | grep visawatcher     # status
 .venv/bin/python tls_bot.py
 ```
 
+## Control from Telegram
+The bot also takes commands in the chat (long-polling, no public URL needed). On start it
+registers a "/" command menu and shows a **tappable button keyboard** under the input box —
+just tap, no typing:
+
+| Command | Button | Action |
+|---|---|---|
+| `/start` | ▶ Start | start the watcher |
+| `/stop` | ■ Stop | stop the watcher |
+| `/run` | 🔄 Run now | check immediately (interrupts the sleep) |
+| `/shots` | 📸 Run + shots | check now **and** send the 3 month screenshots |
+| `/status` | 📊 Status | running/online/cycles/last result |
+
+Only your `TELEGRAM_CHAT_ID` is accepted — commands from anyone else are ignored.
+
 ## Files
-- `server.py` — dashboard + control panel (port 3025), start/stop, status API.
+- `server.py` — dashboard + control panel (port 3025), start/stop, status API, Telegram poller.
 - `watcher.py` — the loop: 3-month checks, internet-resilience, shared state.
 - `browser.py` — Chrome launch, Cloudflare/login handling, multi-month slot detection.
 - `setup_login.py` — one-time manual login + HTML dump.
