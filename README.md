@@ -95,9 +95,25 @@ just tap, no typing:
 | `/stop` | ■ Stop | stop the watcher |
 | `/run` | 🔄 Run now | check immediately (interrupts the sleep) |
 | `/shots` | 📸 Run + shots | check now **and** send the 3 month screenshots |
-| `/status` | 📊 Status | running/online/cycles/last result |
+| `/status` | 📊 Status | running/online/cycles/last result + email + schedule |
+| `/whoami` | — | show which login email is in use (saved vs .env) |
+| `/setemail you@x.com` | — | change the login email |
+| `/setpassword secret` | — | change the password (then delete your message) |
+| `/schedule 09:00 21:00 mon-fri` | — | set a daily ON window (days optional) |
+| `/schedule off` | — | remove the schedule (back to manual) |
 
 Only your `TELEGRAM_CHAT_ID` is accepted — commands from anyone else are ignored.
+
+## Runtime config (no restart needed)
+Editable from **Telegram and the dashboard**; saved to `runtime_config.json` (gitignored,
+overrides `.env`; first run uses `.env`):
+- **Credentials** — email + password. Dashboard shows which email is in use and its source
+  (`.env` vs `saved`). Changing them forces a fresh re-login.
+- **Schedule** — a daily ON window + chosen weekdays. While enabled the bot auto-starts at the
+  window open and auto-stops at close; **the schedule wins** over manual start/stop. No schedule
+  = manual/AUTOSTART as before. Overnight windows (e.g. 22:00–06:00) are supported.
+- **Any change made in the UI sends a Telegram notification.**
+- Appointment URL/group id stay in `.env` (changing to a *different* account needs an `.env` edit).
 
 ## Files
 - `server.py` — dashboard + control panel (port 3025), start/stop, status API, Telegram poller.

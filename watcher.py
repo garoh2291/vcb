@@ -40,6 +40,7 @@ class WatcherState:
         # On-demand control (set by the Telegram poller, consumed by the watcher thread).
         self._wake = threading.Event()
         self._send_shots = False
+        self._force_relogin = False
 
     def request_check(self, send_shots=False):
         """Ask the watcher to run a check immediately (interrupts its sleep)."""
@@ -48,10 +49,22 @@ class WatcherState:
                 self._send_shots = True
         self._wake.set()
 
+    def request_relogin(self):
+        """Force a fresh login next cycle (e.g. after credentials change)."""
+        with self._lock:
+            self._force_relogin = True
+        self._wake.set()
+
     def take_send_shots(self) -> bool:
         with self._lock:
             v = self._send_shots
             self._send_shots = False
+        return v
+
+    def take_force_relogin(self) -> bool:
+        with self._lock:
+            v = self._force_relogin
+            self._force_relogin = False
         return v
 
     def event(self, msg, level="info"):
@@ -197,6 +210,13 @@ def run_watcher(state, stop_event):
                             # --- one check cycle ---
                             cycle_start = _now()
                             send_shots = state.take_send_shots()  # on-demand /shots request
+                            if state.take_force_relogin():
+                                # Credentials changed → drop the session so we log in fresh.
+                                try:
+                                    context.clear_cookies()
+                                    state.event("Credentials changed — forcing re-login.")
+                                except Exception:  # noqa: BLE001
+                                    pass
                             if _reach_calendar(page, state):
                                 month_shots = []
 

@@ -7,6 +7,7 @@ import time
 import requests
 
 import config
+import settings
 
 log = logging.getLogger("browser")
 
@@ -155,7 +156,8 @@ def _submit(page, field_sel):
 def do_login(page) -> bool:
     """Real TLScontact (Keycloak) login. Robust: handles already-logged-in, the
     redirect lag, an optional two-step (email then password), Cloudflare, and retries."""
-    if not (config.TLS_LOGIN and config.TLS_PASSWORD):
+    email_val, pwd_val = settings.get_email(), settings.get_password()
+    if not (email_val and pwd_val):
         return False
     email_sel = "#email-input-field, input[name=username], input[type=email]"
     pwd_sel = "#password-input-field, input[type=password]"
@@ -171,14 +173,14 @@ def do_login(page) -> bool:
                 return True
 
             page.wait_for_selector(email_sel, timeout=25000)
-            page.locator(email_sel).first.fill(config.TLS_LOGIN)
+            page.locator(email_sel).first.fill(email_val)
             page.wait_for_timeout(400)
 
             # Password on the same page, or a two-step flow (submit email first).
             if page.locator(pwd_sel).count() == 0:
                 _submit(page, email_sel)
                 page.wait_for_selector(pwd_sel, timeout=20000)
-            page.locator(pwd_sel).first.fill(config.TLS_PASSWORD)
+            page.locator(pwd_sel).first.fill(pwd_val)
             page.wait_for_timeout(500)
             _submit(page, pwd_sel)
 

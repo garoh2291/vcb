@@ -7,10 +7,12 @@ import logging
 import sys
 import threading
 import time
+from datetime import datetime
 
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, request, send_file
 
 import config
+import settings
 import telegram
 from watcher import WatcherState, run_watcher
 
@@ -54,6 +56,82 @@ def _running():
     return bool(_thread and _thread.is_alive())
 
 
+# ---- Scheduling ----
+
+_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _fmt_schedule(s) -> str:
+    if not s.get("enabled"):
+        return "no schedule (manual)"
+    days = s.get("days") or []
+    dtxt = "every day" if not days else ",".join(_DAYS[d] for d in sorted(days))
+    return f"{s.get('start')}–{s.get('end')} ({dtxt})"
+
+
+def _parse_hhmm(t) -> int:
+    h, m = str(t).split(":")
+    h, m = int(h), int(m)
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError("bad time")
+    return h * 60 + m
+
+
+def _parse_days(text):
+    """'mon-fri' range, 'mon,wed,fri' list, '' => every day."""
+    text = (text or "").strip().lower()
+    if not text:
+        return []
+    if "-" in text and "," not in text:
+        a, b = text.split("-")
+        ia, ib = _DAYS.index(a[:3]), _DAYS.index(b[:3])
+        return list(range(ia, ib + 1)) if ia <= ib else list(range(ia, 7)) + list(range(0, ib + 1))
+    out = []
+    for p in text.replace(" ", ",").split(","):
+        if p[:3] in _DAYS:
+            out.append(_DAYS.index(p[:3]))
+    return sorted(set(out))
+
+
+def _in_window(now, s) -> bool:
+    days = s.get("days") or list(range(7))
+    try:
+        start, end = _parse_hhmm(s["start"]), _parse_hhmm(s["end"])
+    except Exception:  # noqa: BLE001
+        return False
+    cur, wd = now.hour * 60 + now.minute, now.weekday()
+    if start <= end:
+        return wd in days and start <= cur < end
+    # overnight window (e.g. 22:00–06:00)
+    if wd in days and cur >= start:
+        return True
+    if ((wd - 1) % 7) in days and cur < end:
+        return True
+    return False
+
+
+def scheduler_loop():
+    """Every 30s, enforce the schedule window (schedule wins over manual)."""
+    while True:
+        try:
+            s = settings.get_schedule()
+            if s.get("enabled"):
+                want = _in_window(datetime.now(), s)
+                if want and not _running():
+                    start_watcher()
+                    telegram.send_message(
+                        f"🗓️ Schedule: window open — watcher started. ({_fmt_schedule(s)})",
+                        keyboard=True)
+                elif (not want) and _running():
+                    stop_watcher()
+                    telegram.send_message(
+                        f"🗓️ Schedule: window closed — watcher stopped. ({_fmt_schedule(s)})",
+                        keyboard=True)
+        except Exception as e:  # noqa: BLE001
+            log.warning("scheduler error: %s", e)
+        time.sleep(30)
+
+
 # ---- Telegram control (long-polling) ----
 
 def _status_text():
@@ -64,13 +142,49 @@ def _status_text():
 
     return (f"{'🟢 RUNNING' if d['running'] else '🔴 STOPPED'} · "
             f"{'online' if d['online'] else 'OFFLINE'}\n"
+            f"Email: {settings.get_email()} ({settings.email_source()})\n"
+            f"Schedule: {_fmt_schedule(settings.get_schedule())}\n"
             f"Checks: {d['cycles']}\n"
             f"Last check: {ago(d['last_check'])}\n"
             f"Result: {d['last_result']}")
 
 
+_HELP = ("Commands:\n/start · /stop\n/run (check now)\n/shots (check + screenshots)\n"
+         "/status · /whoami\n/setemail you@x.com\n/setpassword secret\n"
+         "/schedule 09:00 21:00 mon-fri · /schedule off")
+
+
+def _handle_schedule_command(arg):
+    a = arg.strip().lower()
+    if not a:
+        telegram.send_message(
+            f"🗓️ Current schedule: {_fmt_schedule(settings.get_schedule())}\n"
+            "Set: /schedule 09:00 21:00 mon-fri\nRemove: /schedule off", keyboard=True)
+        return
+    if a in ("off", "remove", "none", "clear", "disable"):
+        settings.clear_schedule()
+        telegram.send_message("🗓️ Schedule removed (manual mode).", keyboard=True)
+        return
+    parts = a.split()
+    if len(parts) < 2:
+        telegram.send_message("Usage: /schedule 09:00 21:00 [mon-fri]", keyboard=True)
+        return
+    start, end = parts[0], parts[1]
+    days = _parse_days(parts[2]) if len(parts) > 2 else []
+    try:
+        _parse_hhmm(start)
+        _parse_hhmm(end)
+    except Exception:  # noqa: BLE001
+        telegram.send_message("Times must be HH:MM, e.g. /schedule 09:00 21:00", keyboard=True)
+        return
+    settings.set_schedule(start, end, days)
+    telegram.send_message(f"🗓️ Schedule set: {_fmt_schedule(settings.get_schedule())}",
+                          keyboard=True)
+
+
 def _handle_command(text):
-    t = text.strip().lower()
+    raw = text.strip()
+    t = raw.lower()
     if t in ("/start", "▶ start", "start"):
         ok = start_watcher()
         telegram.send_message("▶ Watcher started." if ok else "Already running.", keyboard=True)
@@ -91,10 +205,36 @@ def _handle_command(text):
             telegram.send_message("Watcher is stopped. Send /start first.", keyboard=True)
     elif t in ("/status", "📊 status", "status"):
         telegram.send_message(_status_text(), keyboard=True)
-    else:
+    elif t in ("/whoami", "whoami"):
         telegram.send_message(
-            "Commands:\n/start · /stop\n/run (check now)\n/shots (check + screenshots)\n/status",
-            keyboard=True)
+            f"📧 Email: {settings.get_email()} (source: {settings.email_source()})\n"
+            f"Password: {'set' if settings.password_set() else 'NOT set'}", keyboard=True)
+    else:
+        parts = raw.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if cmd == "/setemail":
+            if not arg:
+                telegram.send_message("Usage: /setemail you@example.com", keyboard=True)
+            else:
+                settings.set_credentials(email=arg)
+                if _running():
+                    state.request_relogin()
+                telegram.send_message(f"📧 Email updated to {settings.get_email()}.", keyboard=True)
+        elif cmd == "/setpassword":
+            if not arg:
+                telegram.send_message("Usage: /setpassword yourpassword", keyboard=True)
+            else:
+                settings.set_credentials(password=arg)
+                if _running():
+                    state.request_relogin()
+                telegram.send_message(
+                    "🔑 Password updated. (You can delete your message above for safety.)",
+                    keyboard=True)
+        elif cmd == "/schedule":
+            _handle_schedule_command(arg)
+        else:
+            telegram.send_message(_HELP, keyboard=True)
 
 
 def telegram_poller():
@@ -139,6 +279,60 @@ def api_start():
 def api_stop():
     ok = stop_watcher()
     return jsonify({"ok": ok, "msg": "stopped" if ok else "not running"})
+
+
+@app.get("/api/config")
+def api_config():
+    return jsonify({
+        "email": settings.get_email(),
+        "email_source": settings.email_source(),
+        "password_set": settings.password_set(),
+        "schedule": settings.get_schedule(),
+    })
+
+
+@app.post("/api/credentials")
+def api_credentials():
+    data = request.get_json(silent=True) or request.form
+    email = (data.get("email") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not email and not password:
+        return jsonify({"ok": False, "msg": "nothing to update"}), 400
+    settings.set_credentials(email, password)
+    if _running():
+        state.request_relogin()
+    changed = " & ".join([w for w, v in (("email", email), ("password", password)) if v])
+    telegram.send_message(
+        f"🔧 Config changed via UI: {changed} updated.\nEmail now: {settings.get_email()}",
+        keyboard=True)
+    return jsonify({"ok": True, "email": settings.get_email()})
+
+
+@app.post("/api/schedule")
+def api_schedule():
+    data = request.get_json(silent=True) or request.form
+    start = (data.get("start") or "").strip()
+    end = (data.get("end") or "").strip()
+    days = data.get("days") or []
+    days = _parse_days(days) if isinstance(days, str) else [int(d) for d in days]
+    try:
+        _parse_hhmm(start)
+        _parse_hhmm(end)
+    except Exception:  # noqa: BLE001
+        return jsonify({"ok": False, "msg": "times must be HH:MM"}), 400
+    settings.set_schedule(start, end, days)
+    s = settings.get_schedule()
+    telegram.send_message(f"🗓️ Config changed via UI: schedule set {_fmt_schedule(s)}.",
+                          keyboard=True)
+    return jsonify({"ok": True, "schedule": s})
+
+
+@app.post("/api/schedule/remove")
+def api_schedule_remove():
+    settings.clear_schedule()
+    telegram.send_message("🗓️ Config changed via UI: schedule removed (manual mode).",
+                          keyboard=True)
+    return jsonify({"ok": True})
 
 
 @app.get("/screenshot.png")
@@ -249,6 +443,27 @@ DASHBOARD = r"""<!doctype html>
   .month .tag.slots{color:#04140c;background:var(--green)}
   .month img{display:block;width:100%;background:#000;cursor:zoom-in}
   .empty{color:var(--dim);font-size:13px;padding:20px}
+  .cfg{padding:16px 18px;display:flex;flex-direction:column;gap:8px}
+  .cfg .cur{font-size:13px;color:var(--dim);margin-bottom:6px}
+  .cfg .cur b{color:var(--ink);font-family:"Syne";font-weight:800}
+  .cfg .src{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--amber);
+    border:1px solid var(--line);border-radius:2px;padding:2px 6px;margin-left:6px}
+  .cfg label{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin-top:6px}
+  .cfg input{background:#0d1013;border:1px solid var(--line);color:var(--ink);
+    font-family:"IBM Plex Mono";font-size:14px;padding:10px 12px;border-radius:2px;width:100%}
+  .cfg input:focus{outline:none;border-color:var(--amber)}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .days{display:flex;flex-wrap:wrap;gap:6px}
+  .days label{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);
+    padding:6px 9px;border-radius:2px;cursor:pointer;color:var(--ink);text-transform:uppercase;margin:0}
+  .days input{width:auto}
+  .btnrow{display:flex;gap:10px;margin-top:6px}
+  button.save{border-color:var(--green);color:var(--green);margin-top:10px}
+  button.save:hover{background:var(--green);color:#04140c}
+  button.del{border-color:var(--red);color:var(--red);margin-top:10px}
+  button.del:hover{background:var(--red);color:#1a0303}
+  .hint{font-size:12px;color:var(--dim);min-height:14px}
+  .hint.ok{color:var(--green)} .hint.err{color:var(--red)}
   footer{color:var(--dim);font-size:11px;letter-spacing:.1em;margin-top:26px;text-align:center}
 </style>
 </head>
@@ -283,6 +498,36 @@ DASHBOARD = r"""<!doctype html>
     <div class="card">
       <h2>Status</h2>
       <div class="result" id="result" style="border-top:none">—</div>
+    </div>
+  </div>
+
+  <div class="cols" style="margin-top:18px">
+    <div class="card">
+      <h2>Credentials</h2>
+      <div class="cfg">
+        <div class="cur">In use: <b id="curEmail">—</b> <span class="src" id="emailSrc"></span></div>
+        <label>Email</label>
+        <input id="inEmail" type="email" placeholder="you@example.com" autocomplete="off">
+        <label>Password</label>
+        <input id="inPass" type="password" placeholder="leave blank to keep current" autocomplete="new-password">
+        <button class="save" onclick="saveCreds()">Save credentials</button>
+        <div class="hint" id="credMsg"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Schedule</h2>
+      <div class="cfg">
+        <div class="cur">Now: <b id="curSched">—</b></div>
+        <div class="row2"><div><label>Start</label><input id="inStart" type="time" value="09:00"></div>
+          <div><label>End</label><input id="inEnd" type="time" value="21:00"></div></div>
+        <label>Days (blank = every day)</label>
+        <div class="days" id="dayBoxes"></div>
+        <div class="btnrow">
+          <button class="save" onclick="saveSchedule()">Save schedule</button>
+          <button class="del" onclick="removeSchedule()">Remove</button>
+        </div>
+        <div class="hint" id="schedMsg"></div>
+      </div>
     </div>
   </div>
 
@@ -334,8 +579,42 @@ async function refresh(){
     mc.innerHTML='<div class="empty">No screenshots yet — first check in progress…</div>';
   }
 }
+// ---- config card ----
+const DAYS=["mon","tue","wed","thu","fri","sat","sun"];
+$('dayBoxes').innerHTML=DAYS.map((d,i)=>`<label><input type="checkbox" value="${i}">${d}</label>`).join('');
+function flash(id,msg,ok){ const e=$(id); e.textContent=msg; e.className='hint '+(ok?'ok':'err'); setTimeout(()=>{e.textContent='';e.className='hint';},5000); }
+async function loadConfig(){
+  let c; try{ c=await (await fetch('/api/config')).json(); }catch(e){ return; }
+  $('curEmail').textContent=c.email||'—';
+  $('emailSrc').textContent=c.email_source||'';
+  const s=c.schedule||{};
+  $('curSched').textContent = s.enabled ? `${s.start}–${s.end} (${(s.days&&s.days.length)?s.days.map(d=>DAYS[d]).join(','):'every day'})` : 'no schedule (manual)';
+  if(s.enabled){ if(s.start)$('inStart').value=s.start; if(s.end)$('inEnd').value=s.end;
+    document.querySelectorAll('#dayBoxes input').forEach(b=>b.checked=(s.days||[]).includes(+b.value)); }
+}
+async function saveCreds(){
+  const email=$('inEmail').value.trim(), password=$('inPass').value;
+  if(!email && !password){ flash('credMsg','Enter an email or password',false); return; }
+  try{ const r=await (await fetch('/api/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})})).json();
+    if(r.ok){ $('inPass').value=''; flash('credMsg','Saved · Telegram notified',true); loadConfig(); }
+    else flash('credMsg',r.msg||'failed',false);
+  }catch(e){ flash('credMsg','request failed',false); }
+}
+async function saveSchedule(){
+  const start=$('inStart').value, end=$('inEnd').value;
+  const days=[...document.querySelectorAll('#dayBoxes input:checked')].map(b=>+b.value);
+  try{ const r=await (await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({start,end,days})})).json();
+    if(r.ok){ flash('schedMsg','Schedule saved · Telegram notified',true); loadConfig(); }
+    else flash('schedMsg',r.msg||'failed',false);
+  }catch(e){ flash('schedMsg','request failed',false); }
+}
+async function removeSchedule(){
+  try{ await fetch('/api/schedule/remove',{method:'POST'}); flash('schedMsg','Schedule removed',true); loadConfig(); }
+  catch(e){ flash('schedMsg','request failed',false); }
+}
 setInterval(()=>{ $('clock').textContent=new Date().toLocaleTimeString(); },1000);
 setInterval(refresh,3000); refresh();
+loadConfig(); setInterval(loadConfig,15000);
 </script>
 </body>
 </html>"""
@@ -345,9 +624,11 @@ def main():
     # Register the "/" command menu and start the Telegram control poller.
     telegram.set_commands()
     threading.Thread(target=telegram_poller, daemon=True).start()
+    threading.Thread(target=scheduler_loop, daemon=True).start()
     telegram.send_message("🤖 Visa watcher control ready. Tap a button or use /help.",
                           keyboard=True)
-    if config.AUTOSTART:
+    # When a schedule is enabled, the scheduler decides when to run. Otherwise honour AUTOSTART.
+    if config.AUTOSTART and not settings.get_schedule().get("enabled"):
         start_watcher()
     log.info("Dashboard on http://127.0.0.1:%d", config.PORT)
     app.run(host="127.0.0.1", port=config.PORT, threaded=True)

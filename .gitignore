@@ -1,5 +1,6 @@
 # secrets
 .env
+runtime_config.json
 
 # browser session (contains your login cookies!) and outputs
 chrome_profile/

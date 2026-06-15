@@ -49,6 +49,10 @@ def set_commands() -> bool:
         {"command": "run", "description": "Check now"},
         {"command": "shots", "description": "Check now + send 3 month screenshots"},
         {"command": "status", "description": "Show current status"},
+        {"command": "whoami", "description": "Show the email in use"},
+        {"command": "setemail", "description": "Set login email: /setemail you@x.com"},
+        {"command": "setpassword", "description": "Set password: /setpassword secret"},
+        {"command": "schedule", "description": "Show/set schedule: /schedule 09:00 21:00 mon-fri"},
         {"command": "help", "description": "Show commands"},
     ]
     try:
