@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# browser session (contains your login cookies!) and outputs
+chrome_profile/
+screenshots/
+*.log
+
+# captured page dumps (may contain personal data)
+*.html
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# local tooling / os
+.claude/
+.DS_Store
