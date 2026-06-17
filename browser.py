@@ -74,12 +74,22 @@ def is_cloudflare(page) -> bool:
 
 BLOCK_HINTS = ("you have been blocked", "sorry, you have been blocked",
                "error 1020", "access denied")
+APP_ERROR_HINTS = ("application error", "server-side exception", "client-side exception")
 
 
 def is_blocked(page) -> bool:
     try:
         body = (page.inner_text("body", timeout=2000) or "").lower()
         return any(h in body for h in BLOCK_HINTS)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def is_app_error(page) -> bool:
+    """TLScontact's own Next.js server-side error page (transient — retry/try another step)."""
+    try:
+        body = (page.inner_text("body", timeout=2000) or "").lower()
+        return any(h in body for h in APP_ERROR_HINTS)
     except Exception:  # noqa: BLE001
         return False
 
@@ -96,25 +106,64 @@ def is_login_page(page) -> bool:
     return False
 
 
-def wait_for_cloudflare(page, notify=None, max_wait=600) -> bool:
-    """If a Cloudflare challenge is up, ping the user and wait for them to solve it
-    in the open window. Returns True once clear, False on timeout."""
+def _try_click_turnstile(page) -> bool:
+    """Click the Cloudflare Turnstile 'Verify you are human' checkbox. The widget is a
+    cross-origin iframe, so we click by coordinates (checkbox sits ~28px in, vertically
+    centered). With a warm stealth profile this passes the managed challenge."""
+    for sel in ('iframe[src*="challenges.cloudflare.com"]',
+                'iframe[title*="Cloudflare" i]',
+                'iframe[title*="challenge" i]',
+                'iframe[title*="human" i]'):
+        try:
+            locs = page.locator(sel)
+            for i in range(locs.count()):
+                box = locs.nth(i).bounding_box()
+                # Skip the invisible 1x1 beacon iframe — click only the real widget.
+                if box and box["width"] > 50 and box["height"] > 30:
+                    page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
+                    return True
+        except Exception:  # noqa: BLE001
+            continue
+    # Fallback: try the checkbox inside the frame directly.
+    try:
+        page.frame_locator('iframe[src*="challenges.cloudflare.com"]') \
+            .locator('input[type="checkbox"], body').first.click(timeout=4000)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def wait_for_cloudflare(page, notify=None, max_wait=150) -> bool:
+    """Try to AUTO-PASS a Cloudflare challenge by clicking the Turnstile checkbox.
+    Only pings the user (via notify) after several failed auto attempts. Returns True
+    once the page is clear, False if it never clears within max_wait."""
     if not is_cloudflare(page):
         return True
-    log.warning("Cloudflare challenge detected.")
-    if notify:
-        try:
-            shot = str(config.SCREENSHOT_DIR / "cloudflare.png")
-            page.screenshot(path=shot)
-            notify(shot, "⚠️ Cloudflare check — please click it in the open Chrome window on the Mac.")
-        except Exception:  # noqa: BLE001
-            pass
+    log.warning("Cloudflare challenge detected — attempting auto-solve.")
     deadline = time.time() + max_wait
+    attempt = 0
+    notified = False
     while time.time() < deadline:
-        time.sleep(5)
         if not is_cloudflare(page):
             log.info("Cloudflare cleared.")
             return True
+        _try_click_turnstile(page)
+        page.wait_for_timeout(4000)
+        attempt += 1
+        if not is_cloudflare(page):
+            log.info("Cloudflare cleared after auto-click (attempt %d).", attempt)
+            return True
+        # After a few failed auto attempts, ask the user to do it by hand.
+        if attempt >= 3 and not notified and notify:
+            try:
+                shot = str(config.SCREENSHOT_DIR / "cloudflare.png")
+                page.screenshot(path=shot)
+                notify(shot, "⚠️ Cloudflare check — couldn't auto-pass. Please click it in "
+                             "the Chrome window on the Mac.")
+            except Exception:  # noqa: BLE001
+                pass
+            notified = True
+        time.sleep(3)
     log.error("Cloudflare not cleared within %ss.", max_wait)
     return False
 

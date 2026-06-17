@@ -31,8 +31,14 @@ LOCATION = os.getenv("LOCATION", "").strip() or (_parts[-2] if len(_parts) >= 2 
 _h = urlparse(HOME_URL)
 BASE = f"{_h.scheme}://{_h.netloc}"
 LOGIN_URL = f"{BASE}/en-us/login"
-# A normal (non-blocked) workflow page we can load, then click the "Appointment booking" tab.
-WORKFLOW_ENTRY_URL = f"{BASE}/en-us/{GROUP_ID}/workflow/applicants-information" if GROUP_ID else HOME_URL
+# Normal (non-blocked) workflow pages we can load, then click the "Appointment booking" tab.
+# Several candidates: TLScontact sometimes throws a server-side error on one step, so we try
+# the next. Any workflow step shows the same stepper (with the appointment-booking tab).
+WORKFLOW_STEPS = ["applicants-information", "application-summary", "service-level"]
+WORKFLOW_ENTRY_URLS = (
+    [f"{BASE}/en-us/{GROUP_ID}/workflow/{s}" for s in WORKFLOW_STEPS] if GROUP_ID else [HOME_URL]
+)
+WORKFLOW_ENTRY_URL = WORKFLOW_ENTRY_URLS[0]  # primary (kept for compatibility)
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "1800"))

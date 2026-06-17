@@ -128,24 +128,47 @@ def _screenshot(page, name):
         return None
 
 
-def _load_workflow(page):
-    """Load the normal (non-blocked) workflow page and clear any Cloudflare check."""
-    page.goto(config.WORKFLOW_ENTRY_URL, wait_until="domcontentloaded", timeout=60000)
-    time.sleep(3)
-    return browser.wait_for_cloudflare(page, notify=telegram.send_photo)
+def _navigate_workflow(page):
+    """Try each workflow entry page until one shows the 'Appointment booking' tab.
+    Handles Cloudflare, login redirects, and TLScontact's transient server-error page.
+    Returns 'ok' | 'login' | 'cloudflare' | 'fail'."""
+    for url in config.WORKFLOW_ENTRY_URLS:
+        for attempt in range(2):  # retry a transient server-side error on the same step
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(3)
+            if not browser.wait_for_cloudflare(page, notify=telegram.send_photo):
+                return "cloudflare"
+            # Hard Cloudflare block ("Sorry, you have been blocked") → recover via the
+            # home page (the human flow), then retry this step.
+            if browser.is_blocked(page):
+                log.warning("Blocked on %s — recovering via home page.", url)
+                page.goto(config.HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(4)
+                browser.wait_for_cloudflare(page, notify=telegram.send_photo)
+                continue
+            if browser.is_login_page(page):
+                return "login"
+            if browser.has_appointment_tab(page):
+                return "ok"
+            if browser.is_app_error(page):
+                log.warning("TLScontact server error on %s — retrying.", url)
+                time.sleep(4)
+                continue          # retry same step
+            break                 # bounced to home / unexpected → try the next step
+    return "fail"
 
 
 def _reach_calendar(page, state):
     """Get to the 3-month calendar via the click-through path (the deep URL is
-    Cloudflare-blocked). Re-logs in if the session expired. Returns True on success."""
-    if not _load_workflow(page):
-        state.event("Cloudflare not cleared.", "warning")
+    Cloudflare-blocked). Re-logs in if needed. Returns True on success."""
+    status = _navigate_workflow(page)
+    if status == "cloudflare":
+        state.event("Cloudflare not cleared (auto-solve failed).", "warning")
         return False
 
-    # Logged out? Either an explicit login/expired page, OR we got bounced to the home
-    # page (no 'Appointment booking' tab present). Both mean: log in, then reload.
-    if browser.is_login_page(page) or not browser.has_appointment_tab(page):
-        state.event("Session expired / bounced to home — logging in.")
+    if status != "ok":
+        # Logged out, or every workflow step failed → log in then try again.
+        state.event("Session expired / workflow unavailable — logging in.")
         if not browser.do_login(page):
             telegram.send_message(
                 "🔑 Auto-login failed. Log in manually in the browser window on the Mac; "
@@ -160,10 +183,9 @@ def _reach_calendar(page, state):
                 return False
         else:
             telegram.send_message("🔐 Re-logged in.")
-        if not _load_workflow(page):
-            return False
-        if not browser.has_appointment_tab(page):
-            state.event("Still not on the workflow page after login.", "warning")
+        status = _navigate_workflow(page)
+        if status != "ok":
+            state.event(f"Still couldn't reach the workflow ({status}).", "warning")
             return False
 
     # Open the calendar by clicking the 'Appointment booking' tab.
